@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 import json
+import pandas as pd
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
@@ -15,18 +16,18 @@ class SCoTDDataset(Dataset):
         self.max_length = max_length
         self.examples = []
         
-        with open(json_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                problem = data['problem']
-                correct_answer = data['correct_answer']
-                
-                for trace in data['thinking_traces']:
-                    self.examples.append({
-                        'problem': problem, 
-                        'thinking': trace,
-                        'answer': correct_answer
-                    })
+        ds = pd.read_json(path_or_buf=json_file, lines=True)
+        for i in range(len(ds)):
+            
+            problem = ds['problem'][i]
+            correct_answer = ds['correct_answer'][i]
+            
+            for trace in ds['thinking_traces'][i]:
+                self.examples.append({
+                    'problem': problem, 
+                    'thinking': trace,
+                    'answer': correct_answer
+                })
 
     def __len__(self):
         return len(self.examples)
