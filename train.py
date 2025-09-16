@@ -1,4 +1,3 @@
-
 import torch 
 import torch.optim as optim
 import torch.nn as nn
@@ -11,7 +10,7 @@ import pandas as pd
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
 class SCoTDDataset(Dataset):
-    def __init__(self, json_file, tokenizer, max_length=1024):
+    def __init__(self, json_file, tokenizer, max_length=256):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.examples = []
@@ -40,7 +39,7 @@ class SCoTDDataset(Dataset):
         tokens = self.tokenizer(
             text, 
             truncation=True, 
-            padding=True,
+            padding='max_length',
             max_length=self.max_length,
             return_tensors="pt"
         )
@@ -81,13 +80,13 @@ def main():
     
     print("Loading Dataset")
     
-    dataset = SCoTDDataset("SCoTD_math_reasoning.jsonl", tokenizer, max_length=1024)
+    dataset = SCoTDDataset("SCoTD_math_reasoning.jsonl", tokenizer, max_length=256)
     
     print(f"Dataset size: {len(dataset)} examples loaded.")
-     
-    # effective is 94, 24 * 4
+    
+    
     # this is achieved with gradient accumulation, 1. processes multiple batches, 2. accumulate gradients 3. then update gradients
-    batch_size = 24
+    batch_size = 16
     gradient_accumulation = 4
     train_loader = DataLoader(
         dataset=dataset,
@@ -102,16 +101,18 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-0.5B",
         torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="cuda"
     )
+    
+    model.gradient_checkpointing_enable()
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01, betas=(0.9, 0.999))
     
-    # achieved from 33k // 96 -> dataset_size // effective batch size
-    steps_per_epoch = 344
+    steps_per_epoch = len(dataset) // (batch_size * gradient_accumulation)
     num_epochs = 5
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1720) # t_max = epochs * steps_per_epoch
+    total_steps = num_epochs * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps) # t_max = epochs * steps_per_epoch
     
     
     model.train()
@@ -128,10 +129,10 @@ def main():
     
     for epoch in range(num_epochs):
         total_loss = 0.0
-        processed_batches = 0
         epoch_start_time = time.time()
         
         optimizer.zero_grad()
+        accumulated_loss = 0.0
         
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch['input_ids'].to(device)
@@ -151,8 +152,7 @@ def main():
                 loss = outputs.loss / gradient_accumulation
                 loss.backward()
                 
-            total_loss += loss.item() * gradient_accumulation
-            processed_batches += 1
+            accumulated_loss += loss.item()
             
             
             if (batch_idx + 1) % gradient_accumulation == 0:
@@ -168,7 +168,8 @@ def main():
                 scheduler.step()
                 
                 current_lr = scheduler.get_last_lr()[0]
-                step_loss = total_loss / processed_batches
+                step_loss = accumulated_loss
+                total_loss += step_loss * gradient_accumulation
                 
                 training_logs['step_losses'].append(step_loss)
                 training_logs['step_numbers'].append(global_step)
@@ -176,13 +177,15 @@ def main():
                 
                 
                 optimizer.zero_grad()
+                accumulated_loss = 0.0
                 
                 if global_step % 50 == 0:
                      print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, Loss: {step_loss:.4f}, LR: {current_lr:.6f}")
                     
                     
         epoch_time = time.time() - epoch_start_time    
-        avg_epoch_loss = total_loss / processed_batches
+        steps_this_epoch = (len(train_loader) + gradient_accumulation - 1) // gradient_accumulation
+        avg_epoch_loss = total_loss / steps_this_epoch
         
         training_logs['epoch_losses'].append(avg_epoch_loss)
         training_logs['epoch_times'].append(epoch_time)
@@ -198,12 +201,14 @@ def main():
                 'loss': avg_epoch_loss,
                 'training_logs': training_logs
             }, f'checkpoint_epoch_{epoch+1}.pt')
+            
+        torch.cuda.empty_cache()
     
     training_logs['total_steps'] = global_step
     with open('training_logs.json', 'w') as f:
         json.dump(training_logs, f, indent=2)
     
-    print("Training complete ^_^")
+    print("Training complete")
         
     
 main()
