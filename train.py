@@ -8,6 +8,8 @@ import json
 import pandas as pd
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 class SCoTDDataset(Dataset):
     def __init__(self, json_file, tokenizer, max_length=256):
@@ -34,7 +36,7 @@ class SCoTDDataset(Dataset):
     def __getitem__(self, idx):
         item = self.examples[idx]
         
-        text = f"Problem: {item['problem']}\n\nSolution:\n{item['thinking']}"
+        text = f"Problem: {item['problem']}\n\nLet me think step by step:\n{item['thinking']}"
         
         tokens = self.tokenizer(
             text, 
@@ -51,9 +53,10 @@ class SCoTDDataset(Dataset):
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    is_cuda = (device.type == 'cuda')
     print(f"Using device: {device}")
     
-    if device == 'cuda':
+    if is_cuda:
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
         # tf32 (tensorfloat32) is a mode that accelerates fp32 convolutions and matmul
@@ -64,10 +67,10 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
         
         
-    mixed_precision = device == 'cuda' and torch.cuda.get_device_capability()[0] >= 7
+    mixed_precision = is_cuda and torch.cuda.get_device_capability()[0] >= 7
     
     #AMP - (Automatic Mixed Precision) GradScaler is used for efficient training by implementing loss scaling in gradient compute
-    scaler = torch.amp.GradScaler('cuda') if mixed_precision else None
+    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
     print(f"Use Mixed Precision: {mixed_precision}")
     
     train_log_format = {
@@ -101,18 +104,21 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-0.5B",
         torch_dtype=torch.float16,
-        device_map="cuda"
+        device_map="auto"
     )
+    
+    model.config.use_cache = False
+    
     
     model.gradient_checkpointing_enable()
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=1e-6, weight_decay=0.01, betas=(0.9, 0.999))
     
-    steps_per_epoch = len(dataset) // (batch_size * gradient_accumulation)
     num_epochs = 5
+    steps_per_epoch = (len(train_loader) + gradient_accumulation - 1) // gradient_accumulation
     total_steps = num_epochs * steps_per_epoch
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps) # t_max = epochs * steps_per_epoch
+    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     
     
     model.train()
@@ -137,46 +143,45 @@ def main():
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-
+        
+            
             labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            raw_loss = outputs.loss 
             
             if mixed_precision and scaler is not None:
-                with torch.amp.autocast(device_type='cuda'):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss / gradient_accumulation
-                    
-                scaler.scale(loss).backward()
-                
+                scaler.scale(raw_loss / gradient_accumulation).backward()
             else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / gradient_accumulation
-                loss.backward()
-                
-            accumulated_loss += loss.item()
+                (raw_loss / gradient_accumulation).backward()
+            
+            accumulated_loss += raw_loss.item()
             
             
             if (batch_idx + 1) % gradient_accumulation == 0:
-                
-                global_step += 1
-                
                 if mixed_precision and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)                    
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)                    
                     optimizer.step()
-                    
+                
+                optimizer.zero_grad()
                 scheduler.step()
+                global_step += 1
                 
                 current_lr = scheduler.get_last_lr()[0]
-                step_loss = accumulated_loss
-                total_loss += step_loss * gradient_accumulation
+                step_loss = accumulated_loss / gradient_accumulation
+                total_loss += step_loss
                 
                 training_logs['step_losses'].append(step_loss)
                 training_logs['step_numbers'].append(global_step)
                 training_logs['learning_rates'].append(current_lr)
                 
                 
-                optimizer.zero_grad()
                 accumulated_loss = 0.0
                 
                 if global_step % 50 == 0:
